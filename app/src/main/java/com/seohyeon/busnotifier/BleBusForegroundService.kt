@@ -1,29 +1,12 @@
 package com.seohyeon.busnotifier
 
 import android.annotation.SuppressLint
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.Service
-import android.bluetooth.BluetoothAdapter
-import android.bluetooth.BluetoothDevice
-import android.bluetooth.BluetoothGatt
-import android.bluetooth.BluetoothGattCallback
-import android.bluetooth.BluetoothGattCharacteristic
-import android.bluetooth.BluetoothManager
-import android.bluetooth.BluetoothProfile
-import android.bluetooth.le.BluetoothLeScanner
-import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanFilter
-import android.bluetooth.le.ScanResult
-import android.bluetooth.le.ScanSettings
+import android.app.*
+import android.bluetooth.*
+import android.bluetooth.le.*
 import android.content.Context
 import android.content.Intent
-import android.os.Build
-import android.os.Handler
-import android.os.IBinder
-import android.os.Looper
-import android.os.ParcelUuid
+import android.os.*
 import androidx.core.app.NotificationCompat
 import org.json.JSONObject
 import java.net.HttpURLConnection
@@ -63,8 +46,7 @@ class BleBusForegroundService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val notification = buildNotification("IO14 버튼 신호 대기 중...")
-        startForeground(NOTIF_ID, notification)
+        startForeground(NOTIF_ID, buildNotification("IO14 버튼 신호 대기 중..."))
         startBleScan()
         return START_STICKY
     }
@@ -73,14 +55,8 @@ class BleBusForegroundService : Service() {
     private fun startBleScan() {
         if (isScanning) return
         val scanner = bluetoothAdapter?.bluetoothLeScanner ?: return
-
-        val filter = ScanFilter.Builder()
-            .setServiceUuid(ParcelUuid(SERVICE_UUID))
-            .build()
-
-        val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-            .build()
+        val filter = ScanFilter.Builder().setServiceUuid(ParcelUuid(SERVICE_UUID)).build()
+        val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
 
         try {
             scanner.startScan(listOf(filter), settings, scanCallback)
@@ -114,8 +90,7 @@ class BleBusForegroundService : Service() {
 
         return try {
             val serviceKeyParam = if (rawKey.contains("%")) rawKey else URLEncoder.encode(rawKey, "UTF-8")
-            val apiUrl = "https://apis.data.go.kr/6410000/busarrivalservice/v2/getBusArrivalListv2" +
-                    "?serviceKey=$serviceKeyParam&stationId=$STATION_ID&format=json"
+            val apiUrl = "https://apis.data.go.kr/6410000/busarrivalservice/v2/getBusArrivalListv2?serviceKey=$serviceKeyParam&stationId=$STATION_ID&format=json"
 
             val conn = (URL(apiUrl).openConnection() as HttpURLConnection).apply {
                 requestMethod = "GET"
@@ -131,11 +106,8 @@ class BleBusForegroundService : Service() {
             }
 
             val root = JSONObject(responseText)
-            val msgBody = root.optJSONObject("response")?.optJSONObject("msgBody")
-                ?: return "522-2:-,-|521:-,-"
-
-            val busArray = msgBody.optJSONArray("busArrivalList")
-                ?: return "522-2:-,-|521:-,-"
+            val msgBody = root.optJSONObject("response")?.optJSONObject("msgBody") ?: return "522-2:-,-|521:-,-"
+            val busArray = msgBody.optJSONArray("busArrivalList") ?: return "522-2:-,-|521:-,-"
 
             var info522 = "-,-"
             var info521 = "-,-"
@@ -145,11 +117,29 @@ class BleBusForegroundService : Service() {
                 val routeName = item.optString("routeName").trim()
                 val destName = item.optString("routeDestName").trim()
                 val staOrder = item.optInt("staOrder", -1)
-
                 val t1 = item.optString("predictTime1").ifEmpty { "-" }
                 val t2 = item.optString("predictTime2").ifEmpty { "-" }
 
                 if (routeName == "522-2") {
                     info522 = "$t1,$t2"
                 } else if (routeName == "521") {
-                    if
+                    val isImae = !destName.contains("양현") && (destName.contains("이매") || staOrder < 30)
+                    if (isImae) {
+                        info521 = "$t1,$t2"
+                    }
+                }
+            }
+            "522-2:$info522\vert{}521:$info521"
+        } catch (e: Exception) {
+            "522-2:ERR,-|521:ERR,-"
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun sendToBoard(device: BluetoothDevice, payload: String) {
+        val gattCallback = object : BluetoothGattCallback() {
+            override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+                if (newState == BluetoothProfile.STATE_CONNECTED) {
+                    gatt.discoverServices()
+                } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                    gatt.close()

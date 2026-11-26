@@ -152,17 +152,4 @@ class BleBusForegroundService : Service() {
                 if (routeName == "522-2") {
                     info522 = "$t1,$t2"
                 } else if (routeName == "521") {
-                    if (!destName.contains("양현") && (destName.contains("이매") || staOrder < 30)) {
-                        info521 = "$t1,$t2"
-                    }
-                }
-            }
-            "522-2:$info522\vert{}521:$info521"
-        } catch (e: Exception) {
-            "522-2:ERR,-|521:ERR,-"
-        }
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun sendToBoard(device: BluetoothDevice, payload: String) {
-        device.connectGatt(
+                    if

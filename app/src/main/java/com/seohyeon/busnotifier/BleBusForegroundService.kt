@@ -90,7 +90,8 @@ class BleBusForegroundService : Service() {
 
         return try {
             val serviceKeyParam = if (rawKey.contains("%")) rawKey else URLEncoder.encode(rawKey, "UTF-8")
-            val apiUrl = "https://apis.data.go.kr/6410000/busarrivalservice/v2/getBusArrivalListv2?serviceKey=$serviceKeyParam&stationId=$STATION_ID&format=json"
+            val baseUrl = "https://apis.data.go.kr/6410000/busarrivalservice/v2/getBusArrivalListv2"
+            val apiUrl = "$baseUrl?serviceKey=$serviceKeyParam&stationId=$STATION_ID&format=json"
 
             val conn = (URL(apiUrl).openConnection() as HttpURLConnection).apply {
                 requestMethod = "GET"
@@ -129,7 +130,7 @@ class BleBusForegroundService : Service() {
                     }
                 }
             }
-            "522-2:$info522\vert{}521:$info521"
+            "522-2:$info522|521:$info521"
         } catch (e: Exception) {
             "522-2:ERR,-|521:ERR,-"
         }
@@ -143,3 +144,81 @@ class BleBusForegroundService : Service() {
                     gatt.discoverServices()
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     gatt.close()
+                    isProcessing = false
+                }
+            }
+
+            override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+                val rxChar = gatt.getService(SERVICE_UUID)?.getCharacteristic(CHAR_RX_UUID)
+                if (rxChar != null) {
+                    val bytes = payload.toByteArray(StandardCharsets.UTF_8)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        gatt.writeCharacteristic(rxChar, bytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        rxChar.value = bytes
+                        @Suppress("DEPRECATION")
+                        gatt.writeCharacteristic(rxChar)
+                    }
+                } else {
+                    gatt.disconnect()
+                }
+            }
+
+            override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
+                lastSentTime = System.currentTimeMillis()
+                broadcastStatus("전송 완료! 보드 30초 표시 중...", payload)
+                updateNotification("최근 전송: $payload")
+                handler.postDelayed({ gatt.disconnect() }, 400)
+            }
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+        } else {
+            device.connectGatt(this, false, gattCallback)
+        }
+    }
+
+    private fun broadcastStatus(status: String, data: String?) {
+        val intent = Intent(ACTION_STATUS_UPDATE).apply {
+            setPackage(packageName)
+            putExtra(EXTRA_STATUS, status)
+            putExtra(EXTRA_LOG, status)
+            if (data != null) putExtra(EXTRA_DATA, data)
+        }
+        sendBroadcast(intent)
+    }
+
+    private fun updateNotification(text: String) {
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        manager.notify(NOTIF_ID, buildNotification(text))
+    }
+
+    private fun buildNotification(contentText: String): Notification {
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("서현역 AK플라자 (07169) 버스 알리미")
+            .setContentText(contentText)
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setOngoing(true)
+            .build()
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(CHANNEL_ID, "버스 알리미 서비스", NotificationManager.IMPORTANCE_LOW)
+            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    override fun onDestroy() {
+        if (isScanning) {
+            try { bleScanner?.stopScan(scanCallback) } catch (_: Exception) {}
+            isScanning = false
+        }
+        super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+}

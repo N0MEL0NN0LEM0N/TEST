@@ -4,14 +4,11 @@ import android.annotation.SuppressLint
 import android.app.*
 import android.bluetooth.*
 import android.bluetooth.le.*
-import android.content.Context
-import android.content.Intent
+import android.content.*
 import android.os.*
 import androidx.core.app.NotificationCompat
 import org.json.JSONObject
-import java.net.HttpURLConnection
-import java.net.URL
-import java.net.URLEncoder
+import java.net.*
 import java.nio.charset.StandardCharsets
 import java.util.UUID
 import java.util.concurrent.Executors
@@ -26,7 +23,6 @@ class BleBusForegroundService : Service() {
         const val EXTRA_STATUS = "status"
         const val EXTRA_DATA = "data"
         const val EXTRA_LOG = "log"
-
         private val SERVICE_UUID = UUID.fromString("6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
         private val CHAR_RX_UUID = UUID.fromString("6E400002-B5A3-F393-E0A9-E50E24DCCA9E")
     }
@@ -40,14 +36,16 @@ class BleBusForegroundService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        createNotificationChannel()
-        val manager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
-        bluetoothAdapter = manager.adapter
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val ch = NotificationChannel(CHANNEL_ID, "버스 알리미", NotificationManager.IMPORTANCE_LOW)
+            getSystemService(NotificationManager::class.java).createNotificationChannel(ch)
+        }
+        bluetoothAdapter = (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
         bleScanner = bluetoothAdapter?.bluetoothLeScanner
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForeground(NOTIF_ID, buildNotification("IO14 버튼 신호 대기 중..."))
+        startForeground(NOTIF_ID, buildNotif("IO14 버튼 신호 대기 중..."))
         startBleScan()
         return START_STICKY
     }
@@ -58,13 +56,12 @@ class BleBusForegroundService : Service() {
         val scanner = bluetoothAdapter?.bluetoothLeScanner ?: return
         val filter = ScanFilter.Builder().setServiceUuid(ParcelUuid(SERVICE_UUID)).build()
         val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
-
         try {
             scanner.startScan(listOf(filter), settings, scanCallback)
             isScanning = true
-            broadcastStatus("보드 신호 스캔 중...", null)
+            sendStatus("보드 신호 스캔 중...", null)
         } catch (e: Exception) {
-            broadcastStatus("BLE 스캔 오류: ${e.message}", null)
+            sendStatus("BLE 오류: ${e.message}", null)
         }
     }
 
@@ -73,82 +70,137 @@ class BleBusForegroundService : Service() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val now = System.currentTimeMillis()
             if (isProcessing || now - lastSentTime < 25_000L) return
-
             isProcessing = true
-            broadcastStatus("보드 감지됨! 버스 정보 조회 중...", null)
-
-            Thread {
-                val payload = fetchBusArrivalData()
-                sendToBoard(result.device, payload)
-            }.start()
+            sendStatus("보드 감지됨! 조회 중...", null)
+            Thread { sendToBoard(result.device, fetchBusData()) }.start()
         }
     }
 
-    private fun findStoredApiKey(): String {
-        val prefNames = listOf("bus_prefs", "BusNotifierPrefs", "${packageName}_preferences", "settings")
-        for (name in prefNames) {
-            val map = getSharedPreferences(name, Context.MODE_PRIVATE).all
-            for ((_, value) in map) {
-                val str = value?.toString()?.trim() ?: ""
-                if (str.length >= 32 && !str.startsWith("206")) {
-                    return str
-                }
+    private fun getApiKey(): String {
+        for (name in listOf("bus_prefs", "BusNotifierPrefs", "${packageName}_preferences", "settings")) {
+            for ((_, v) in getSharedPreferences(name, Context.MODE_PRIVATE).all) {
+                val s = v?.toString()?.trim() ?: ""
+                if (s.length >= 32 && !s.startsWith("206")) return s
             }
         }
         return ""
     }
 
-    private fun requestStationJson(serviceKeyParam: String, stationId: String): JSONObject? {
+    private fun getJson(keyParam: String, stId: String): JSONObject? {
         return try {
-            val baseUrl = "https://apis.data.go.kr/6410000/busarrivalservice/v2/getBusArrivalListv2"
-            val apiUrl = "$baseUrl?serviceKey=$serviceKeyParam&stationId=$stationId&format=json"
-            val conn = (URL(apiUrl).openConnection() as HttpURLConnection).apply {
-                requestMethod = "GET"
+            val u = "https://apis.data.go.kr/6410000/busarrivalservice/v2/getBusArrivalListv2?serviceKey=$keyParam&stationId=$stId&format=json"
+            val c = (URL(u).openConnection() as HttpURLConnection).apply {
                 setRequestProperty("User-Agent", "Mozilla/5.0")
-                connectTimeout = 4000
-                readTimeout = 4000
+                connectTimeout = 4000; readTimeout = 4000
             }
-            val text = conn.inputStream.bufferedReader(StandardCharsets.UTF_8).use { it.readText() }
-            conn.disconnect()
-            if (text.trim().startsWith("{")) JSONObject(text) else null
-        } catch (_: Exception) {
-            null
-        }
+            val txt = c.inputStream.bufferedReader(StandardCharsets.UTF_8).use { it.readText() }
+            c.disconnect()
+            if (txt.trim().startsWith("{")) JSONObject(txt) else null
+        } catch (_: Exception) { null }
     }
 
-    // 521번 양방향(2개)과 522-2번이 동시에 정차하는 서현역.AK플라자(07169) 자동 탐색
-    private fun resolveRealStationId(serviceKeyParam: String): String {
+    private fun findStationId(keyParam: String): String {
         val prefs = getSharedPreferences("bus_prefs", Context.MODE_PRIVATE)
         val cached = prefs.getString("verified_station_id_v2", "") ?: ""
         if (cached.isNotEmpty()) return cached
 
-        broadcastStatus("07169(양방향 521+522-2) 정류소 탐색 중...", null)
-        val foundId = AtomicReference("")
+        sendStatus("07169 정류소 ID 자동 탐색 중...", null)
+        val found = AtomicReference("")
         val pool = Executors.newFixedThreadPool(16)
-
         for (num in 206000001..206000800) {
             pool.submit {
-                if (foundId.get().isNotEmpty()) return@submit
+                if (found.get().isNotEmpty()) return@submit
                 val stId = num.toString()
-                val json = requestStationJson(serviceKeyParam, stId) ?: return@submit
-                val arr = json.optJSONObject("response")?.optJSONObject("msgBody")?.optJSONArray("busArrivalList") ?: return@submit
-
-                var count521 = 0
-                var has522_2 = false
+                val arr = getJson(keyParam, stId)?.optJSONObject("response")?.optJSONObject("msgBody")?.optJSONArray("busArrivalList") ?: return@submit
+                var c521 = 0; var has522 = false
                 for (i in 0 until arr.length()) {
-                    val rName = arr.getJSONObject(i).optString("routeName").trim()
-                    if (rName == "521") count521++
-                    if (rName == "522-2") has522_2 = true
+                    val r = arr.getJSONObject(i).optString("routeName").trim()
+                    if (r == "521") c521++
+                    if (r == "522-2") has522 = true
                 }
-                if (count521 >= 2 && has522_2) {
-                    foundId.compareAndSet("", stId)
-                }
+                if (c521 >= 2 && has522) found.compareAndSet("", stId)
             }
         }
         pool.shutdown()
         while (!pool.isTerminated) {
-            if (foundId.get().isNotEmpty()) {
-                pool.shutdownNow()
-                break
-            }
+            if (found.get().isNotEmpty()) { pool.shutdownNow(); break }
             Thread.sleep(100)
+        }
+        return found.get().also {
+            if (it.isNotEmpty()) {
+                prefs.edit().putString("verified_station_id_v2", it).apply()
+                sendStatus("07169 ID 확정: $it", null)
+            }
+        }
+    }
+
+    private fun fetchBusData(): String {
+        val rawKey = getApiKey()
+        if (rawKey.isEmpty()) return "522-2:NOKEY,-|521:NOKEY,-"
+        return try {
+            val keyParam = if (rawKey.contains("%")) rawKey else URLEncoder.encode(rawKey, "UTF-8")
+            val stId = findStationId(keyParam)
+            if (stId.isEmpty()) return "522-2:NOID,-|521:NOID,-"
+
+            val arr = getJson(keyParam, stId)?.optJSONObject("response")?.optJSONObject("msgBody")?.optJSONArray("busArrivalList")
+                ?: return "522-2:-,-|521:-,-"
+
+            var b522 = "-,-"; var b521 = "-,-"
+            for (i in 0 until arr.length()) {
+                val it = arr.getJSONObject(i)
+                val r = it.optString("routeName").trim()
+                val d = it.optString("routeDestName").trim()
+                val ord = it.optInt("staOrder", -1)
+                val t1 = it.optString("predictTime1").ifEmpty { "-" }
+                val t2 = it.optString("predictTime2").ifEmpty { "-" }
+                if (r == "522-2") b522 = "$t1,$t2"
+                else if (r == "521" && !d.contains("양현") && (d.contains("이매") || ord < 30)) b521 = "$t1,$t2"
+            }
+            "522-2:$b522|521:$b521"
+        } catch (_: Exception) { "522-2:ERR,-|521:ERR,-" }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun sendToBoard(device: BluetoothDevice, payload: String) {
+        val cb = object : BluetoothGattCallback() {
+            override fun onConnectionStateChange(g: BluetoothGatt, s: Int, ns: Int) {
+                if (ns == BluetoothProfile.STATE_CONNECTED) g.discoverServices()
+                else if (ns == BluetoothProfile.STATE_DISCONNECTED) { g.close(); isProcessing = false }
+            }
+            override fun onServicesDiscovered(g: BluetoothGatt, s: Int) {
+                val rx = g.getService(SERVICE_UUID)?.getCharacteristic(CHAR_RX_UUID) ?: return g.disconnect()
+                val bytes = payload.toByteArray(StandardCharsets.UTF_8)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) g.writeCharacteristic(rx, bytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+                else { @Suppress("DEPRECATION") rx.value = bytes; @Suppress("DEPRECATION") g.writeCharacteristic(rx) }
+            }
+            override fun onCharacteristicWrite(g: BluetoothGatt, c: BluetoothGattCharacteristic, s: Int) {
+                lastSentTime = System.currentTimeMillis()
+                sendStatus("전송 완료! ($payload)", payload)
+                (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).notify(NOTIF_ID, buildNotif("최근: $payload"))
+                handler.postDelayed({ g.disconnect() }, 400)
+            }
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) device.connectGatt(this, false, cb, BluetoothDevice.TRANSPORT_LE)
+        else device.connectGatt(this, false, cb)
+    }
+
+    private fun sendStatus(st: String, data: String?) {
+        sendBroadcast(Intent(ACTION_STATUS_UPDATE).apply {
+            setPackage(packageName); putExtra(EXTRA_STATUS, st); putExtra(EXTRA_LOG, st)
+            if (data != null) putExtra(EXTRA_DATA, data)
+        })
+    }
+
+    private fun buildNotif(txt: String): Notification = NotificationCompat.Builder(this, CHANNEL_ID)
+        .setContentTitle("서현역 AK플라자 (07169) 버스 알리미").setContentText(txt)
+        .setSmallIcon(android.R.drawable.ic_dialog_info).setOngoing(true).build()
+
+    @SuppressLint("MissingPermission")
+    override fun onDestroy() {
+        if (isScanning) { try { bleScanner?.stopScan(scanCallback) } catch (_: Exception) {}; isScanning = false }
+        super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+}
+// END

@@ -116,17 +116,16 @@ class BleBusForegroundService : Service() {
         }
     }
 
-    // 521번과 522-2번이 동시에 정차하는 진짜 07169 정류소 ID 자동 탐색 (최초 1회)
+    // 521번 양방향(2개)과 522-2번이 동시에 정차하는 서현역.AK플라자(07169) 자동 탐색
     private fun resolveRealStationId(serviceKeyParam: String): String {
         val prefs = getSharedPreferences("bus_prefs", Context.MODE_PRIVATE)
-        val cached = prefs.getString("verified_station_id", "") ?: ""
+        val cached = prefs.getString("verified_station_id_v2", "") ?: ""
         if (cached.isNotEmpty()) return cached
 
-        broadcastStatus("07169 정류소 ID 자동 탐색 중...", null)
+        broadcastStatus("07169(양방향 521+522-2) 정류소 탐색 중...", null)
         val foundId = AtomicReference("")
         val pool = Executors.newFixedThreadPool(16)
 
-        // 분당구(206000001 ~ 206000800) 범위 병렬 탐색
         for (num in 206000001..206000800) {
             pool.submit {
                 if (foundId.get().isNotEmpty()) return@submit
@@ -134,14 +133,14 @@ class BleBusForegroundService : Service() {
                 val json = requestStationJson(serviceKeyParam, stId) ?: return@submit
                 val arr = json.optJSONObject("response")?.optJSONObject("msgBody")?.optJSONArray("busArrivalList") ?: return@submit
 
-                var has521 = false
+                var count521 = 0
                 var has522_2 = false
                 for (i in 0 until arr.length()) {
                     val rName = arr.getJSONObject(i).optString("routeName").trim()
-                    if (rName == "521") has521 = true
+                    if (rName == "521") count521++
                     if (rName == "522-2") has522_2 = true
                 }
-                if (has521 && has522_2) {
+                if (count521 >= 2 && has522_2) {
                     foundId.compareAndSet("", stId)
                 }
             }
@@ -153,142 +152,3 @@ class BleBusForegroundService : Service() {
                 break
             }
             Thread.sleep(100)
-        }
-
-        val result = foundId.get()
-        if (result.isNotEmpty()) {
-            prefs.edit().putString("verified_station_id", result).apply()
-            broadcastStatus("정류소 ID 발견: $result", null)
-        }
-        return result
-    }
-
-    private fun fetchBusArrivalData(): String {
-        val rawKey = findStoredApiKey()
-        if (rawKey.isEmpty()) return "522-2:NOKEY,-|521:NOKEY,-"
-
-        return try {
-            val serviceKeyParam = if (rawKey.contains("%")) rawKey else URLEncoder.encode(rawKey, "UTF-8")
-            val realStationId = resolveRealStationId(serviceKeyParam)
-            if (realStationId.isEmpty()) {
-                broadcastStatus("정류소 ID 탐색 실패", null)
-                return "522-2:NOID,-|521:NOID,-"
-            }
-
-            val json = requestStationJson(serviceKeyParam, realStationId)
-            val arr = json?.optJSONObject("response")?.optJSONObject("msgBody")?.optJSONArray("busArrivalList")
-                ?: return "522-2:-,-|521:-,-"
-
-            var info522 = "-,-"
-            var info521 = "-,-"
-
-            for (i in 0 until arr.length()) {
-                val item = arr.getJSONObject(i)
-                val routeName = item.optString("routeName").trim()
-                val destName = item.optString("routeDestName").trim()
-                val staOrder = item.optInt("staOrder", -1)
-                val t1 = item.optString("predictTime1").ifEmpty { "-" }
-                val t2 = item.optString("predictTime2").ifEmpty { "-" }
-
-                if (routeName == "522-2") {
-                    info522 = "$t1,$t2"
-                } else if (routeName == "521") {
-                    // 이매촌한신 방면만 선택 (양현보도육교 방면 제외)
-                    val isImae = !destName.contains("양현") && (destName.contains("이매") || staOrder < 30)
-                    if (isImae) {
-                        info521 = "$t1,$t2"
-                    }
-                }
-            }
-            "522-2:$info522|521:$info521"
-        } catch (e: Exception) {
-            "522-2:ERR,-|521:ERR,-"
-        }
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun sendToBoard(device: BluetoothDevice, payload: String) {
-        val gattCallback = object : BluetoothGattCallback() {
-            override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-                if (newState == BluetoothProfile.STATE_CONNECTED) {
-                    gatt.discoverServices()
-                } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                    gatt.close()
-                    isProcessing = false
-                }
-            }
-
-            override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-                val rxChar = gatt.getService(SERVICE_UUID)?.getCharacteristic(CHAR_RX_UUID)
-                if (rxChar != null) {
-                    val bytes = payload.toByteArray(StandardCharsets.UTF_8)
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        gatt.writeCharacteristic(rxChar, bytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
-                    } else {
-                        @Suppress("DEPRECATION")
-                        rxChar.value = bytes
-                        @Suppress("DEPRECATION")
-                        gatt.writeCharacteristic(rxChar)
-                    }
-                } else {
-                    gatt.disconnect()
-                }
-            }
-
-            override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
-                lastSentTime = System.currentTimeMillis()
-                broadcastStatus("전송 완료! ($payload)", payload)
-                updateNotification("최근 전송: $payload")
-                handler.postDelayed({ gatt.disconnect() }, 400)
-            }
-        }
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
-        } else {
-            device.connectGatt(this, false, gattCallback)
-        }
-    }
-
-    private fun broadcastStatus(status: String, data: String?) {
-        val intent = Intent(ACTION_STATUS_UPDATE).apply {
-            setPackage(packageName)
-            putExtra(EXTRA_STATUS, status)
-            putExtra(EXTRA_LOG, status)
-            if (data != null) putExtra(EXTRA_DATA, data)
-        }
-        sendBroadcast(intent)
-    }
-
-    private fun updateNotification(text: String) {
-        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        manager.notify(NOTIF_ID, buildNotification(text))
-    }
-
-    private fun buildNotification(contentText: String): Notification {
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("서현역 AK플라자 (07169) 버스 알리미")
-            .setContentText(contentText)
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setOngoing(true)
-            .build()
-    }
-
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(CHANNEL_ID, "버스 알리미 서비스", NotificationManager.IMPORTANCE_LOW)
-            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
-        }
-    }
-
-    @SuppressLint("MissingPermission")
-    override fun onDestroy() {
-        if (isScanning) {
-            try { bleScanner?.stopScan(scanCallback) } catch (_: Exception) {}
-            isScanning = false
-        }
-        super.onDestroy()
-    }
-
-    override fun onBind(intent: Intent?): IBinder? = null
-}

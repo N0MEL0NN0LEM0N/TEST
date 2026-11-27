@@ -14,6 +14,7 @@ import java.net.URL
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.util.UUID
+import java.util.regex.Pattern
 
 class BleBusForegroundService : Service() {
 
@@ -83,9 +84,22 @@ class BleBusForegroundService : Service() {
         }
     }
 
+    private fun findStoredApiKey(): String {
+        val prefNames = listOf("bus_prefs", "BusNotifierPrefs", "${packageName}_preferences", "settings")
+        for (name in prefNames) {
+            val map = getSharedPreferences(name, Context.MODE_PRIVATE).all
+            for ((_, value) in map) {
+                val str = value?.toString()?.trim() ?: ""
+                if (str.length >= 32 && str != STATION_ID) {
+                    return str
+                }
+            }
+        }
+        return ""
+    }
+
     private fun fetchBusArrivalData(): String {
-        val prefs = getSharedPreferences("bus_prefs", Context.MODE_PRIVATE)
-        val rawKey = prefs.getString("api_key", "")?.trim() ?: ""
+        val rawKey = findStoredApiKey()
         if (rawKey.isEmpty()) return "522-2:NOKEY,-|521:NOKEY,-"
 
         return try {
@@ -99,34 +113,54 @@ class BleBusForegroundService : Service() {
                 readTimeout = 7000
             }
 
-            val responseText = conn.inputStream.bufferedReader(StandardCharsets.UTF_8).use { it.readText() }
+            val stream = if (conn.responseCode in 200..299) conn.inputStream else conn.errorStream
+            val responseText = stream?.bufferedReader(StandardCharsets.UTF_8)?.use { it.readText() } ?: ""
             conn.disconnect()
 
-            if (responseText.contains("SERVICE_KEY_IS_NOT_REGISTERED_ERROR")) {
+            if (responseText.contains("SERVICE_KEY_IS_NOT_REGISTERED")) {
                 return "522-2:KEY_ERR,-|521:KEY_ERR,-"
             }
-
-            val root = JSONObject(responseText)
-            val msgBody = root.optJSONObject("response")?.optJSONObject("msgBody") ?: return "522-2:-,-|521:-,-"
-            val busArray = msgBody.optJSONArray("busArrivalList") ?: return "522-2:-,-|521:-,-"
 
             var info522 = "-,-"
             var info521 = "-,-"
 
-            for (i in 0 until busArray.length()) {
-                val item = busArray.getJSONObject(i)
-                val routeName = item.optString("routeName").trim()
-                val destName = item.optString("routeDestName").trim()
-                val staOrder = item.optInt("staOrder", -1)
-                val t1 = item.optString("predictTime1").ifEmpty { "-" }
-                val t2 = item.optString("predictTime2").ifEmpty { "-" }
+            if (responseText.trim().startsWith("{")) {
+                val root = JSONObject(responseText)
+                val msgBody = root.optJSONObject("response")?.optJSONObject("msgBody")
+                val busArray = msgBody?.optJSONArray("busArrivalList")
+                if (busArray != null) {
+                    for (i in 0 until busArray.length()) {
+                        val item = busArray.getJSONObject(i)
+                        val routeName = item.optString("routeName").trim()
+                        val destName = item.optString("routeDestName").trim()
+                        val staOrder = item.optInt("staOrder", -1)
+                        val t1 = item.optString("predictTime1").ifEmpty { "-" }
+                        val t2 = item.optString("predictTime2").ifEmpty { "-" }
 
-                if (routeName == "522-2") {
-                    info522 = "$t1,$t2"
-                } else if (routeName == "521") {
-                    val isImae = !destName.contains("양현") && (destName.contains("이매") || staOrder < 30)
-                    if (isImae) {
-                        info521 = "$t1,$t2"
+                        if (routeName == "522-2") {
+                            info522 = "$t1,$t2"
+                        } else if (routeName == "521") {
+                            val isImae = !destName.contains("양현") && (destName.contains("이매") || staOrder < 30)
+                            if (isImae) info521 = "$t1,$t2"
+                        }
+                    }
+                }
+            } else {
+                // XML 응답 대응 파싱
+                val matcher = Pattern.compile("<busArrivalList>(.*?)</busArrivalList>", Pattern.DOTALL).matcher(responseText)
+                while (matcher.find()) {
+                    val block = matcher.group(1) ?: ""
+                    val routeName = extractTag(block, "routeName")
+                    val destName = extractTag(block, "routeDestName")
+                    val staOrder = extractTag(block, "staOrder").toIntOrNull() ?: -1
+                    val t1 = extractTag(block, "predictTime1").ifEmpty { "-" }
+                    val t2 = extractTag(block, "predictTime2").ifEmpty { "-" }
+
+                    if (routeName == "522-2") {
+                        info522 = "$t1,$t2"
+                    } else if (routeName == "521") {
+                        val isImae = !destName.contains("양현") && (destName.contains("이매") || staOrder < 30)
+                        if (isImae) info521 = "$t1,$t2"
                     }
                 }
             }
@@ -134,6 +168,11 @@ class BleBusForegroundService : Service() {
         } catch (e: Exception) {
             "522-2:ERR,-|521:ERR,-"
         }
+    }
+
+    private fun extractTag(xml: String, tag: String): String {
+        val m = Pattern.compile("<$tag>(.*?)</$tag>").matcher(xml)
+        return if (m.find()) m.group(1)?.trim() ?: "" else ""
     }
 
     @SuppressLint("MissingPermission")
@@ -167,7 +206,7 @@ class BleBusForegroundService : Service() {
 
             override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
                 lastSentTime = System.currentTimeMillis()
-                broadcastStatus("전송 완료! 보드 30초 표시 중...", payload)
+                broadcastStatus("전송 완료! ($payload)", payload)
                 updateNotification("최근 전송: $payload")
                 handler.postDelayed({ gatt.disconnect() }, 400)
             }

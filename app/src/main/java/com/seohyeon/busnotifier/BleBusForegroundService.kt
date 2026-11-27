@@ -14,7 +14,8 @@ import java.net.URL
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.util.UUID
-import java.util.regex.Pattern
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicReference
 
 class BleBusForegroundService : Service() {
 
@@ -28,7 +29,6 @@ class BleBusForegroundService : Service() {
 
         private val SERVICE_UUID = UUID.fromString("6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
         private val CHAR_RX_UUID = UUID.fromString("6E400002-B5A3-F393-E0A9-E50E24DCCA9E")
-        private const val STATION_ID = "206000299"
     }
 
     private var bluetoothAdapter: BluetoothAdapter? = null
@@ -90,7 +90,7 @@ class BleBusForegroundService : Service() {
             val map = getSharedPreferences(name, Context.MODE_PRIVATE).all
             for ((_, value) in map) {
                 val str = value?.toString()?.trim() ?: ""
-                if (str.length >= 32 && str != STATION_ID) {
+                if (str.length >= 32 && !str.startsWith("206")) {
                     return str
                 }
             }
@@ -98,101 +98,112 @@ class BleBusForegroundService : Service() {
         return ""
     }
 
-    private fun fetchBusArrivalData(): String {
-        val rawKey = findStoredApiKey()
-        if (rawKey.isEmpty()) {
-            broadcastStatus("오류: 저장된 API 키 없음", null)
-            return "522-2:NOKEY,-|521:NOKEY,-"
-        }
-
+    private fun requestStationJson(serviceKeyParam: String, stationId: String): JSONObject? {
         return try {
-            val serviceKeyParam = if (rawKey.contains("%")) rawKey else URLEncoder.encode(rawKey, "UTF-8")
             val baseUrl = "https://apis.data.go.kr/6410000/busarrivalservice/v2/getBusArrivalListv2"
-            val apiUrl = "$baseUrl?serviceKey=$serviceKeyParam&stationId=$STATION_ID&format=json"
-
+            val apiUrl = "$baseUrl?serviceKey=$serviceKeyParam&stationId=$stationId&format=json"
             val conn = (URL(apiUrl).openConnection() as HttpURLConnection).apply {
                 requestMethod = "GET"
                 setRequestProperty("User-Agent", "Mozilla/5.0")
-                setRequestProperty("Accept", "application/json, text/xml, */*")
-                connectTimeout = 8000
-                readTimeout = 8000
+                connectTimeout = 4000
+                readTimeout = 4000
             }
-
-            val code = conn.responseCode
-            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-            val responseText = stream?.bufferedReader(StandardCharsets.UTF_8)?.use { it.readText() } ?: ""
+            val text = conn.inputStream.bufferedReader(StandardCharsets.UTF_8).use { it.readText() }
             conn.disconnect()
-
-            if (responseText.contains("SERVICE_KEY_IS_NOT_REGISTERED")) {
-                broadcastStatus("API 오류: 미등록 서비스키 (HTTP $code)", null)
-                return "522-2:KEY_ERR,-|521:KEY_ERR,-"
-            }
-
-            var info522 = "-,-"
-            var info521 = "-,-"
-            val foundRoutes = mutableListOf<String>()
-
-            if (responseText.trim().startsWith("{")) {
-                val root = JSONObject(responseText)
-                val msgBody = root.optJSONObject("response")?.optJSONObject("msgBody")
-                val busArray = msgBody?.optJSONArray("busArrivalList")
-                if (busArray != null) {
-                    for (i in 0 until busArray.length()) {
-                        val item = busArray.getJSONObject(i)
-                        val routeName = item.optString("routeName").trim()
-                        val routeId = item.optString("routeId").trim()
-                        val destName = item.optString("routeDestName").trim()
-                        val staOrder = item.optInt("staOrder", -1)
-                        val t1 = item.optString("predictTime1").ifEmpty { "-" }
-                        val t2 = item.optString("predictTime2").ifEmpty { "-" }
-
-                        foundRoutes.add("$routeName($routeId/$destName/$staOrder):$t1")
-
-                        if (routeName == "522-2" || routeId == "204000083") {
-                            info522 = "$t1,$t2"
-                        } else if (routeName == "521" || routeId == "204000046") {
-                            val isImae = !destName.contains("양현") && (destName.contains("이매") || staOrder < 30)
-                            if (isImae) info521 = "$t1,$t2"
-                        }
-                    }
-                }
-            } else {
-                val matcher = Pattern.compile("<busArrivalList>(.*?)</busArrivalList>", Pattern.DOTALL).matcher(responseText)
-                while (matcher.find()) {
-                    val block = matcher.group(1) ?: ""
-                    val routeName = extractTag(block, "routeName")
-                    val routeId = extractTag(block, "routeId")
-                    val destName = extractTag(block, "routeDestName")
-                    val staOrder = extractTag(block, "staOrder").toIntOrNull() ?: -1
-                    val t1 = extractTag(block, "predictTime1").ifEmpty { "-" }
-                    val t2 = extractTag(block, "predictTime2").ifEmpty { "-" }
-
-                    foundRoutes.add("$routeName($routeId/$destName/$staOrder):$t1")
-
-                    if (routeName == "522-2" || routeId == "204000083") {
-                        info522 = "$t1,$t2"
-                    } else if (routeName == "521" || routeId == "204000046") {
-                        val isImae = !destName.contains("양현") && (destName.contains("이매") || staOrder < 30)
-                        if (isImae) info521 = "$t1,$t2"
-                    }
-                }
-            }
-
-            if (info522 == "-,-" && info521 == "-,-") {
-                val preview = if (foundRoutes.isNotEmpty()) foundRoutes.joinToString(",") else responseText.take(120)
-                broadcastStatus("조회됨(매칭없음): $preview", null)
-            }
-
-            "522-2:$info522|521:$info521"
-        } catch (e: Exception) {
-            broadcastStatus("통신 예외: ${e.javaClass.simpleName} - ${e.message}", null)
-            "522-2:ERR,-|521:ERR,-"
+            if (text.trim().startsWith("{")) JSONObject(text) else null
+        } catch (_: Exception) {
+            null
         }
     }
 
-    private fun extractTag(xml: String, tag: String): String {
-        val m = Pattern.compile("<$tag>(.*?)</$tag>").matcher(xml)
-        return if (m.find()) m.group(1)?.trim() ?: "" else ""
+    // 521번과 522-2번이 동시에 정차하는 진짜 07169 정류소 ID 자동 탐색 (최초 1회)
+    private fun resolveRealStationId(serviceKeyParam: String): String {
+        val prefs = getSharedPreferences("bus_prefs", Context.MODE_PRIVATE)
+        val cached = prefs.getString("verified_station_id", "") ?: ""
+        if (cached.isNotEmpty()) return cached
+
+        broadcastStatus("07169 정류소 ID 자동 탐색 중...", null)
+        val foundId = AtomicReference("")
+        val pool = Executors.newFixedThreadPool(16)
+
+        // 분당구(206000001 ~ 206000800) 범위 병렬 탐색
+        for (num in 206000001..206000800) {
+            pool.submit {
+                if (foundId.get().isNotEmpty()) return@submit
+                val stId = num.toString()
+                val json = requestStationJson(serviceKeyParam, stId) ?: return@submit
+                val arr = json.optJSONObject("response")?.optJSONObject("msgBody")?.optJSONArray("busArrivalList") ?: return@submit
+
+                var has521 = false
+                var has522_2 = false
+                for (i in 0 until arr.length()) {
+                    val rName = arr.getJSONObject(i).optString("routeName").trim()
+                    if (rName == "521") has521 = true
+                    if (rName == "522-2") has522_2 = true
+                }
+                if (has521 && has522_2) {
+                    foundId.compareAndSet("", stId)
+                }
+            }
+        }
+        pool.shutdown()
+        while (!pool.isTerminated) {
+            if (foundId.get().isNotEmpty()) {
+                pool.shutdownNow()
+                break
+            }
+            Thread.sleep(100)
+        }
+
+        val result = foundId.get()
+        if (result.isNotEmpty()) {
+            prefs.edit().putString("verified_station_id", result).apply()
+            broadcastStatus("정류소 ID 발견: $result", null)
+        }
+        return result
+    }
+
+    private fun fetchBusArrivalData(): String {
+        val rawKey = findStoredApiKey()
+        if (rawKey.isEmpty()) return "522-2:NOKEY,-|521:NOKEY,-"
+
+        return try {
+            val serviceKeyParam = if (rawKey.contains("%")) rawKey else URLEncoder.encode(rawKey, "UTF-8")
+            val realStationId = resolveRealStationId(serviceKeyParam)
+            if (realStationId.isEmpty()) {
+                broadcastStatus("정류소 ID 탐색 실패", null)
+                return "522-2:NOID,-|521:NOID,-"
+            }
+
+            val json = requestStationJson(serviceKeyParam, realStationId)
+            val arr = json?.optJSONObject("response")?.optJSONObject("msgBody")?.optJSONArray("busArrivalList")
+                ?: return "522-2:-,-|521:-,-"
+
+            var info522 = "-,-"
+            var info521 = "-,-"
+
+            for (i in 0 until arr.length()) {
+                val item = arr.getJSONObject(i)
+                val routeName = item.optString("routeName").trim()
+                val destName = item.optString("routeDestName").trim()
+                val staOrder = item.optInt("staOrder", -1)
+                val t1 = item.optString("predictTime1").ifEmpty { "-" }
+                val t2 = item.optString("predictTime2").ifEmpty { "-" }
+
+                if (routeName == "522-2") {
+                    info522 = "$t1,$t2"
+                } else if (routeName == "521") {
+                    // 이매촌한신 방면만 선택 (양현보도육교 방면 제외)
+                    val isImae = !destName.contains("양현") && (destName.contains("이매") || staOrder < 30)
+                    if (isImae) {
+                        info521 = "$t1,$t2"
+                    }
+                }
+            }
+            "522-2:$info522|521:$info521"
+        } catch (e: Exception) {
+            "522-2:ERR,-|521:ERR,-"
+        }
     }
 
     @SuppressLint("MissingPermission")
